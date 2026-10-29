@@ -1,0 +1,4 @@
+add_executable(sis_localization_example sis_sim.c)
+target_link_libraries(sis_localization_example PRIVATE igraph)
+add_test(NAME sis_localization_example_test COMMAND sis_localization_example ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/sample_a.edgelist 0.12 12 2 111)
+set_tests_properties(sis_localization_example_test PROPERTIES PASS_REGULAR_EXPRESSION "count_hist")

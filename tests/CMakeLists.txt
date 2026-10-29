@@ -1071,3 +1071,5 @@ add_legacy_tests(
   FOLDER tests/unit NAMES
   percolation
 )
+
+add_subdirectory(${PROJECT_SOURCE_DIR}/examples/sis_localization ${CMAKE_CURRENT_BINARY_DIR}/sis_localization)
