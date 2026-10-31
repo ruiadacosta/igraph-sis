@@ -1,7 +1,3 @@
-/* Adapted from Rui Costa's SIS_localization_l_0.12_N_10^6_runs_50000.c
- * (8 April 2016).
- * Model: SIS.
- */
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -12,7 +8,13 @@
 
 #define MAX_N 128
 #define POOL_SIZE 64
-#define MAX_STEPS 5000000ULL
+#define MAX_ITERATIONS 5000000ULL
+
+typedef struct {
+    double lambda;
+} ModelConfig;
+
+static ModelConfig model;
 
 typedef struct {
     int n, runs, burnin;
@@ -35,19 +37,25 @@ static double uniform(void) {
 }
 static int choose(int n) { return (int)(uniform() * n); }
 
-static void observe(Stats *s, int run, const int *active, int count) {
+static void record_state(Stats *s, int run, const int *active, int count) {
+    if (!count)
+        return;
+
     if (s->trace) {
         fprintf(s->trace, "%d %d", run, count);
         for (int j = 0; j < count; ++j) fprintf(s->trace, " %d", active[j]);
         fputc('\n', s->trace);
     }
-
+    if (run >= s->burnin) {
+        ++s->count_hist[count];
+        ++s->norm;
+    }
 }
 static void report(const Stats *s) {
-    if (!s->norm) fail("No observed events");
+    if (!s->norm) fail("No records to report");
     for (int k = 1; k <= s->n; ++k)
         printf("count_hist %d %.17g\n", k, (double)s->count_hist[k] / (double)s->norm);
-    fprintf(stderr, "vertices=%d runs=%d burnin=%d iterations=%llu\n",
+    fprintf(stderr, "vertices=%d runs=%d burnin=%d records=%llu\n",
             s->n, s->runs, s->burnin, s->norm);
 }
 
@@ -128,38 +136,70 @@ static void read_graph(const char *path) {
         fail("Require a simple undirected graph");
 }
 
-static void infect_vertex(int v) {
-    if (!infected[v]) {
-        active[infected_count++] = v;
-        for (int j = 0; j < vertex_degree(v); ++j)
-            attempts[attempt_count++] = (Attempt){v, vertex_neighbor(v, j)};
-    }
-    infected[v] = 1;
+static void add_active_vertex(int v) {
+    active[infected_count++] = v;
+    for (int j = 0; j < vertex_degree(v); ++j)
+        attempts[attempt_count++] = (Attempt){v, vertex_neighbor(v, j)};
 }
 
-static void recover_random_infected_vertex(void) {
-    int j = choose(infected_count), v = active[j];
+static void remove_active_vertex(int v) {
+    int j = 0;
     int begin = 0;
-    for (int i = 0; i < j; ++i) begin += vertex_degree(active[i]);
+    while (active[j] != v) {
+        begin += vertex_degree(active[j]);
+        ++j;
+    }
+
     int last = active[infected_count - 1];
     if (j != infected_count - 1) {
         int tail = attempt_count - vertex_degree(last);
         int middle = tail - begin - vertex_degree(v);
         Attempt saved[MAX_N];
+
         memcpy(saved, attempts + tail, (size_t)vertex_degree(last) * sizeof *saved);
-        memmove(attempts + begin + vertex_degree(last), attempts + begin + vertex_degree(v),
+        memmove(attempts + begin + vertex_degree(last),
+                attempts + begin + vertex_degree(v),
                 (size_t)middle * sizeof *attempts);
         memcpy(attempts + begin, saved, (size_t)vertex_degree(last) * sizeof *saved);
     }
+
     attempt_count -= vertex_degree(v);
     active[j] = active[--infected_count];
-    infected[v] = 0;
+}
+
+static int recovery_selected(void) {
+    double ratio =
+        model.lambda * ((double)attempt_count / infected_count);
+
+    return uniform() < 1.0 / (1.0 + ratio);
+}
+
+static void process_attempt(Stats *s, int run) {
+    int v, value;
+    if (recovery_selected()) {
+        v = active[choose(infected_count)];
+        value = 0;
+    } else {
+        v = attempts[choose(attempt_count)].target;
+        value = 1;
+    }
+
+    value ^= infected[v];
+    infected[v] ^= value;
+
+    record_state(s, run, active, infected_count * value);
+
+    if (value) {
+        if (infected[v])
+            add_active_vertex(v);
+        else
+            remove_active_vertex(v);
+    }
 }
 
 static void replay(const char *graph_path, const char *lambda_text, const char *path) {
     read_graph(graph_path);
-    double lambda = parse_lambda(lambda_text);
-    (void)lambda;
+    model.lambda = parse_lambda(lambda_text);
     FILE *f = fopen(path, "r");
     if (!f) fail("Cannot open trace");
     Stats s = {0};
@@ -186,12 +226,11 @@ static void replay(const char *graph_path, const char *lambda_text, const char *
         }
         end_row(p);
         previous = (int)run;
-        observe(&s, (int)run, active, (int)count);
-        if (run >= s.burnin) ++s.norm;
+        record_state(&s, (int)run, active, (int)count);
     }
     if (ferror(f) || previous != s.runs - 1) fail("Incomplete trace");
     fclose(f);
-    if (!s.norm) fail("No observed records");
+    if (!s.norm) fail("No records to report");
 }
 
 static void simulate(int argc, char **argv) {
@@ -199,7 +238,7 @@ static void simulate(int argc, char **argv) {
     int runs = (int)parse_integer(argv[3], 1, 100000);
     int burnin = (int)parse_integer(argv[4], 0, runs - 1);
     rng_state = (uint64_t)parse_integer(argv[5], 1, 2147483647L);
-    double lambda = parse_lambda(argv[2]);
+    model.lambda = parse_lambda(argv[2]);
     read_graph(argv[1]);
     Stats s = {0};
     s.n = n; s.runs = runs; s.burnin = burnin;
@@ -212,35 +251,24 @@ static void simulate(int argc, char **argv) {
     }
     int pool[POOL_SIZE][MAX_N], lengths[POOL_SIZE];
     for (int i = 0; i < POOL_SIZE; ++i) { pool[i][0] = n - 1; lengths[i] = 1; }
-    unsigned long long steps = 0;
+    unsigned long long i = 0;
     for (int run = 0; run < runs; ++run) {
         int slot = choose(POOL_SIZE);
         infected_count = attempt_count = 0;
         memset(infected, 0, sizeof infected);
-        for (int j = 0; j < lengths[slot]; ++j)
-            infect_vertex(pool[slot][j]);
+        for (int j = 0; j < lengths[slot]; ++j) {
+            int v = pool[slot][j];
+            infected[v] = 1;
+            add_active_vertex(v);
+        }
         while (infected_count) {
-            if (++steps > MAX_STEPS) fail("Simulation event limit reached");
-            if (run >= burnin) {
-                ++s.count_hist[infected_count];
-                ++s.norm;
-            }
+            if (++i > MAX_ITERATIONS) fail("Simulation event limit reached");
             if (uniform() < 1.0 / POOL_SIZE) {
                 slot = choose(POOL_SIZE);
                 lengths[slot] = infected_count;
                 memcpy(pool[slot], active, (size_t)infected_count * sizeof(int));
             }
-            double ratio = lambda * ((double)attempt_count / infected_count);
-            if (uniform() < 1.0 / (1.0 + ratio)) {
-                observe(&s, run, active, infected_count);
-                recover_random_infected_vertex();
-            } else {
-                int target = attempts[choose(attempt_count)].target;
-                if (!infected[target]) {
-                    observe(&s, run, active, infected_count);
-                }
-                infect_vertex(target);
-            }
+            process_attempt(&s, run);
         }
     }
     if (s.trace && fclose(s.trace)) fail("Trace write error");
